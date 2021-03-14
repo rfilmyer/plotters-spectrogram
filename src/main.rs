@@ -5,7 +5,7 @@ use plotters::prelude::*;
 use ndarray_stats::QuantileExt;
 
 const WINDOW_SIZE: usize = 1024;
-const OVERLAP: f64 = 0.5;
+const OVERLAP: f64 = 0.9;
 const SKIP_SIZE: usize = (WINDOW_SIZE as f64 * (1f64 - OVERLAP)) as usize;
 
 fn main() {
@@ -14,8 +14,10 @@ fn main() {
         .samples()
         .collect::<Result<Vec<i16>, _>>()
         .unwrap();
-
-    println!("Creating windows {} samples long from a timeline {} samples long, picking every {} windows for a total of {} windows.", WINDOW_SIZE, samples.len(), SKIP_SIZE, (samples.len() / SKIP_SIZE) - 1);
+    
+    println!("Creating windows {window_size} samples long from a timeline {num_samples} samples long, picking every {skip_size} windows with a {overlap} overlap for a total of {num_windows} windows.",
+        window_size = WINDOW_SIZE, num_samples = samples.len(), skip_size = SKIP_SIZE, overlap = OVERLAP, num_windows = (samples.len() / SKIP_SIZE) - 1,
+    );
 
     // Convert to an ndarray
     // Hopefully this will keep me from messing up the dimensions
@@ -30,7 +32,6 @@ fn main() {
         .collect::<Vec<_>>()
         ;
     let windows = ndarray::stack(Axis(0), &windows).unwrap();
-    println!("{:?}", windows);
 
     // So to perform the FFT on each window we need a Complex<f32>, and right now we have i16s, so first let's convert
     let mut windows = windows.map(|i| Complex::from(*i as f32));
@@ -45,33 +46,74 @@ fn main() {
     windows.axis_iter_mut(Axis(0))
         .for_each(|mut frame| { fft.process(frame.as_slice_mut().unwrap()); });
     
-    // Finally, get the real component of those complex numbers we get back from the FFT
+    // Get the real component of those complex numbers we get back from the FFT
     let windows = windows.map(|i| i.re);
+
+    // And finally, only look at the first half of the spectrogram - the first (n/2)+1 points of each FFT
+    // https://dsp.stackexchange.com/questions/4825/why-is-the-fft-mirrored
+    let windows = windows.slice_move(ndarray::s![.., ..((WINDOW_SIZE / 2) + 1)]);
 
     // get some dimensions for drawing
     // The shape is in [nrows, ncols], but we want to transpose this.
-    let height = *windows.shape().last().unwrap();
-    let width = *windows.shape().first().unwrap();
+    let (width, height) = match windows.shape() {
+        &[first, second] => (first, second),
+        _ => panic!("Windows is a {}D array, expected a 2D array", windows.ndim())
+    };
     
 
     println!("Generating a {} wide x {} high image", width, height);
 
+    let image_dimensions: (u32, u32) = (width as u32, height as u32);
     let root_drawing_area = 
         BitMapBackend::new(
             "output.png", 
-            (width as u32, height as u32), // width x height. Worth it if we ever want to resize the graph.
+            image_dimensions, // width x height. Worth it if we ever want to resize the graph.
         ).into_drawing_area();
 
-    let spectrogram_cells = root_drawing_area.split_evenly((width, height));
+    let spectrogram_cells = root_drawing_area.split_evenly((height, width));
 
     let windows_scaled = windows.map(|i| i.abs()/(WINDOW_SIZE as f32));
     let highest_spectral_density = windows_scaled.max_skipnan();
+    
+    // transpose and flip around to prepare for graphing
+    /* the array is currently oriented like this:
+        t = 0 |
+              |
+              |
+              |
+              |
+        t = n +-------------------
+            f = 0              f = m
 
-    for (cell, spectral_density) in spectrogram_cells.iter().zip(windows_scaled.iter()) {
-            let scaling_factor = spectral_density / highest_spectral_density;
-            // let scaling_factor = scaling_factor.sqrt();
-            let brightness: u8 = (255 as f32 * scaling_factor as f32).round() as u8;
-            let color = RGBColor(brightness, brightness, brightness);
-            cell.fill(&color).unwrap();
+        so it needs to be flipped...
+        t = 0 |
+              |
+              |
+              |
+              |
+        t = n +-------------------
+            f = m              f = 0
+
+        ...and transposed...
+        f = m |
+              |
+              |
+              |
+              |
+        f = 0 +-------------------
+            t = 0              t = n
+        
+        ... in order to look like a proper spectrogram
+    */
+    let windows_flipped = windows_scaled.slice(ndarray::s![.., ..; -1]); // flips the
+    let windows_flipped = windows_flipped.t();
+
+    // Finally add a color scale
+    let color_scale = colorous::MAGMA;
+
+    for (cell, spectral_density) in spectrogram_cells.iter().zip(windows_flipped.iter()) {
+            let spectral_density_scaled = spectral_density.sqrt() / highest_spectral_density.sqrt();
+            let color = color_scale.eval_continuous(spectral_density_scaled as f64);
+            cell.fill(&RGBColor(color.r, color.g, color.b)).unwrap();
         };
 }
